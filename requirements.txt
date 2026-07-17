@@ -1,0 +1,8 @@
+pyautogui
+pyperclip
+pywinauto
+opencv-python
+airtest
+numpy
+pywin32
+beautifulsoup4
