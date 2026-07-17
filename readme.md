@@ -1,4 +1,4 @@
-# Honor-Unban 桌面端答题助手（二次修复版）
+# Honor-Unban-Fix 桌面端答题助手（二次修复版）
 
 这是一个运行在 Windows 桌面端的微信小程序答题自动化工具。脚本面向“腾讯游戏安全中心”答题页面，负责读取题目、匹配题库、选择答案、提交结果，并在答题结束后完成页面上的后续验证操作。
 
@@ -65,8 +65,8 @@
 ## 安装
 
 ```powershell
-git clone https://github.com/yangfei957/Honor-Unban.git
-cd Honor-Unban
+git clone https://github.com/yangfei957/Honor-Unban-Fix.git
+cd Honor-Unban-Fix
 
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -117,7 +117,7 @@ pip install -r requirements.txt
 ## 项目结构
 
 ```text
-Honor-Unban/
+Honor-Unban-Fix/
 ├── auto_solver_refactored.py   # 主程序
 ├── master_qa_bank.json         # 文字题题库
 ├── requirements.txt            # Python 依赖
