@@ -118,6 +118,7 @@ pip install -r requirements.txt
 
 ```text
 Honor-Unban-Fix/
+├── AGENTS.md                   # AI 与开发者接手指南
 ├── auto_solver_refactored.py   # 主程序
 ├── master_qa_bank.json         # 文字题题库
 ├── requirements.txt            # Python 依赖
@@ -126,6 +127,12 @@ Honor-Unban-Fix/
 ├── logs/                       # 运行日志（自动生成）
 └── screenshots/                # 调试截图和答案记录（自动生成）
 ```
+
+## 开发文档
+
+需要在另一台电脑上继续开发，或交给 AI 编程工具接手时，请先阅读
+[AGENTS.md](AGENTS.md)。其中记录了当前架构、关键状态机约束、题库结构、
+测试命令、真题调试流程、已知限制和 Git 提交边界。
 
 ## 常见问题
 
