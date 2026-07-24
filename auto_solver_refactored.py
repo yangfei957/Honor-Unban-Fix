@@ -57,6 +57,20 @@ if not os.path.exists(SCREENSHOT_RUN_DIR): os.makedirs(SCREENSHOT_RUN_DIR)
 solved_questions = {}  # 存储本次运行成功解答的题目及其答案
 qa_bank = {}           # 存储从文件中加载的题库数据
 
+
+TRANSITION_SUCCESS = "success"
+TRANSITION_WRONG = "wrong"
+TRANSITION_UNKNOWN = "unknown"
+
+
+class TransitionEvidenceInsufficient(RuntimeError):
+    """提交后无法确认成功或答错，必须停止使用旧题上下文。"""
+
+
+class StaleQuestionContext(RuntimeError):
+    """页面已经切到新题，但调用方仍持有上一题的坐标或选项。"""
+
+
 # ==================== 日志配置 START ====================
 # 获取一个日志记录器实例
 logger = logging.getLogger(__name__)
@@ -144,8 +158,11 @@ INITIAL_VALIDATION_DELAY = 0.2
 # --- 已有延时配置 ---
 # 提交后首次读取页面的等待时间，以及过渡页最长等待时间。
 FIXED_POST_SUBMIT_DELAY = 1.0
-QUESTION_TRANSITION_TIMEOUT = 4.0
+QUESTION_TRANSITION_TIMEOUT = 10.0
+QUESTION_TRANSITION_GRACE_TIMEOUT = 10.0
 QUESTION_TRANSITION_POLL_INTERVAL = 0.2
+QUESTION_HTML_FALLBACK_INTERVAL = 1.0
+QUESTION_SAME_EVIDENCE_MAX_AGE = 1.2
 # 每次点击选项后的等待时间（秒）。如果点击后UI反应慢，可适当增加此值。
 POST_TOUCH_DELAY = 0.05
 
@@ -445,6 +462,69 @@ def _get_uia_question_data():
         }
     except Exception as exc:
         logger.warning(f"解析 UIA 题目失败: {exc}")
+        return None
+
+
+def _get_uia_page_marker():
+    """快速读取页面阶段标记，不要求题干和选项控件完整出现。"""
+    if TARGET_WINDOW is None:
+        return None
+    try:
+        elements = TARGET_WINDOW.descendants()
+        text_entries = [
+            (
+                (element.window_text() or "").strip(),
+                element.element_info.control_type,
+            )
+            for element in elements
+        ]
+        page_text = " ".join(text for text, _ in text_entries if text)
+
+        if "点击完成任务" in page_text or "安全的知识又增加了" in page_text:
+            return {"page_state": "complete", "source": "uia_marker"}
+
+        if "请求失败" in page_text or "请稍后再试" in page_text:
+            return {
+                "page_state": "request_error",
+                "source": "uia_marker",
+                "message": page_text,
+            }
+
+        feedback_markers = ("答错", "回答错误", "再试试", "答案错误")
+        feedback_detected = any(marker in page_text for marker in feedback_markers)
+        feedback_action = next(
+            (
+                text
+                for text, control_type in text_entries
+                if control_type in ("Button", "Hyperlink")
+                and text in ("确定", "知道了", "再试一次", "继续")
+            ),
+            None,
+        )
+
+        question_numbers = [
+            text
+            for text, _ in text_entries
+            if re.fullmatch(r"第\d+题", text)
+        ]
+        if question_numbers:
+            return {
+                "page_state": "question",
+                "source": "uia_marker",
+                "q_num": question_numbers[-1],
+                "feedback_detected": feedback_detected,
+                "feedback_action": feedback_action,
+            }
+        if feedback_detected:
+            return {
+                "page_state": "feedback",
+                "source": "uia_marker",
+                "feedback_detected": True,
+                "feedback_action": feedback_action,
+            }
+        return None
+    except Exception:
+        # Chromium 切页时控件树短暂消失是正常状态，轮询路径不刷警告。
         return None
 
 
@@ -1269,51 +1349,181 @@ def dismiss_answer_feedback():
     return True
 
 
+def _evaluate_transition_observation(observation, current_q_num, current_q_text):
+    """把一次页面观测归类为成功、明确答错或证据不足。"""
+    if not observation:
+        return {
+            "status": TRANSITION_UNKNOWN,
+            "same_question": False,
+            "reason": "页面没有可用标记",
+        }
+
+    page_state = observation.get("page_state")
+    if page_state == "complete":
+        return {
+            "status": TRANSITION_SUCCESS,
+            "same_question": False,
+            "reason": "已进入答题完成页",
+        }
+    if page_state == "request_error":
+        return {
+            "status": TRANSITION_UNKNOWN,
+            "same_question": False,
+            "reason": "小程序请求失败",
+            "request_error": True,
+        }
+    new_q_num = observation.get("q_num")
+    if current_q_num and new_q_num:
+        if new_q_num != current_q_num:
+            return {
+                "status": TRANSITION_SUCCESS,
+                "same_question": False,
+                "reason": f"题号已变化: {current_q_num} -> {new_q_num}",
+            }
+        if (
+            observation.get("feedback_detected")
+            and observation.get("feedback_action")
+        ):
+            return {
+                "status": TRANSITION_WRONG,
+                "same_question": True,
+                "reason": "检测到明确的答错反馈",
+            }
+        return {
+            "status": TRANSITION_UNKNOWN,
+            "same_question": True,
+            "reason": f"题号仍为 {current_q_num}",
+        }
+
+    if page_state == "feedback":
+        return {
+            "status": TRANSITION_WRONG,
+            "same_question": True,
+            "reason": "检测到独立答错反馈页",
+        }
+
+    new_q_text = observation.get("q_text")
+    normalized_old_text = re.sub(r"\s+", "", current_q_text or "")
+    normalized_new_text = re.sub(r"\s+", "", new_q_text or "")
+    if (
+        normalized_old_text
+        and normalized_new_text
+        and normalized_new_text != normalized_old_text
+    ):
+        return {
+            "status": TRANSITION_SUCCESS,
+            "same_question": False,
+            "reason": "题号缺失，但题干已变化",
+        }
+
+    return {
+        "status": TRANSITION_UNKNOWN,
+        "same_question": False,
+        "reason": "缺少题号或题干变化证据",
+    }
+
+
 def wait_for_next_question(current_q_num, current_q_text):
-    """提交后以题号为主判据检查是否进入下一题。"""
+    """提交后等待确定证据，并返回 success/wrong/unknown 三态。"""
     logger.info(f"提交后等待 {FIXED_POST_SUBMIT_DELAY} 秒检查题号...")
     time.sleep(FIXED_POST_SUBMIT_DELAY)
-    deadline = time.monotonic() + QUESTION_TRANSITION_TIMEOUT
-    same_page_reads = 0
+    started_at = time.monotonic()
+    normal_deadline = started_at + QUESTION_TRANSITION_TIMEOUT
+    final_deadline = normal_deadline + QUESTION_TRANSITION_GRACE_TIMEOUT
+    next_full_read_at = started_at + QUESTION_HTML_FALLBACK_INTERVAL
+    next_feedback_check_at = started_at
+    last_same_seen_at = None
+    last_wait_log_at = 0.0
+    grace_logged = False
 
-    while time.monotonic() < deadline:
-        new_q_info = get_clipboard_data_robust()
-        if not new_q_info:
-            logger.info("提交后处于无题目过渡页，继续等待...")
-            time.sleep(QUESTION_TRANSITION_POLL_INTERVAL)
-            continue
+    while True:
+        now = time.monotonic()
+        observations = []
 
-        if new_q_info.get('page_state') == 'complete':
-            logger.info("已进入答题完成页，当前答案正确。")
-            complete_quiz_task()
-            return True
+        marker = _get_uia_page_marker()
+        if marker:
+            observations.append(marker)
 
-        if new_q_info.get('page_state') == 'request_error':
-            dismiss_answer_feedback()
-            raise RuntimeError("小程序请求失败，已停止本轮答题以避免误判答案。")
+        if now >= next_full_read_at:
+            full_data = get_clipboard_data_robust()
+            if full_data:
+                observations.append(full_data)
+            next_full_read_at = (
+                time.monotonic() + QUESTION_HTML_FALLBACK_INTERVAL
+            )
 
-        new_q_num = new_q_info.get('q_num')
-        if current_q_num and new_q_num:
-            if new_q_num != current_q_num:
-                logger.info(f"题号已变化: {current_q_num} -> {new_q_num}")
-                return True
-            logger.info(f"题号仍为 {current_q_num}，检查反馈弹窗或最终页过渡。")
-            if dismiss_answer_feedback():
-                return False
-            same_page_reads += 1
-            if same_page_reads >= 3:
-                logger.info("题号连续三次未变化，本次答案错误。")
-                return False
-            time.sleep(QUESTION_TRANSITION_POLL_INTERVAL)
-            continue
+        for observation in observations:
+            evidence = _evaluate_transition_observation(
+                observation, current_q_num, current_q_text
+            )
+            if evidence.get("request_error"):
+                dismiss_answer_feedback()
+                raise RuntimeError(
+                    "小程序请求失败，已停止本轮答题以避免误判答案。"
+                )
+            if evidence["status"] == TRANSITION_SUCCESS:
+                logger.info(evidence["reason"])
+                if observation.get("page_state") == "complete":
+                    complete_quiz_task()
+                return TRANSITION_SUCCESS
+            if evidence["status"] == TRANSITION_WRONG:
+                logger.info(evidence["reason"])
+                feedback_action = observation.get("feedback_action")
+                if not (
+                    feedback_action and _click_uia_button(feedback_action)
+                ):
+                    dismiss_answer_feedback()
+                return TRANSITION_WRONG
+            if evidence["same_question"]:
+                last_same_seen_at = time.monotonic()
+                if last_same_seen_at >= next_feedback_check_at:
+                    logger.info(
+                        f"题号仍为 {current_q_num}，检查是否存在答错弹窗。"
+                    )
+                    if dismiss_answer_feedback():
+                        return TRANSITION_WRONG
+                    next_feedback_check_at = (
+                        time.monotonic() + QUESTION_HTML_FALLBACK_INTERVAL
+                    )
 
-        if new_q_info.get('q_text') != current_q_text:
-            logger.info("题号缺失，但题干已变化，判定进入下一题。")
-            return True
+        now = time.monotonic()
+        same_question_is_recent = (
+            last_same_seen_at is not None
+            and now - last_same_seen_at <= QUESTION_SAME_EVIDENCE_MAX_AGE
+        )
+        if now >= normal_deadline and not grace_logged:
+            if same_question_is_recent:
+                logger.info(
+                    f"题号在 {QUESTION_TRANSITION_TIMEOUT:.1f} 秒内始终为 "
+                    f"{current_q_num}，本次答案错误。"
+                )
+                dismiss_answer_feedback()
+                return TRANSITION_WRONG
+            grace_logged = True
+            logger.warning(
+                "正常等待期内题号仍不可用，进入慢加载保护期；"
+                "保护期内不会使用上一题继续作答。"
+            )
+
+        if now >= final_deadline:
+            if same_question_is_recent:
+                logger.info(
+                    f"慢加载保护结束时题号仍为 {current_q_num}，"
+                    "本次答案错误。"
+                )
+                dismiss_answer_feedback()
+                return TRANSITION_WRONG
+            logger.warning(
+                "慢加载保护结束后仍没有新题号、原题号或明确反馈，"
+                "状态为证据不足。"
+            )
+            return TRANSITION_UNKNOWN
+
+        if now - last_wait_log_at >= 1.0 and not observations:
+            phase = "慢加载保护期" if grace_logged else "正常等待期"
+            logger.info(f"提交后处于无题目过渡页（{phase}），继续等待...")
+            last_wait_log_at = now
         time.sleep(QUESTION_TRANSITION_POLL_INTERVAL)
-
-    logger.warning("等待下一题超时，未取得足够的成功证据。")
-    return False
 
 def write_solution_map_to_file():
     """在脚本结束时，将本次运行解出的所有题目和答案写入一个JSON文件。"""
@@ -1332,6 +1542,25 @@ def write_solution_map_to_file():
         logger.error(f"写入答案映射文件失败: {e}")
 
 # ============================ 【核心升级】带验证的解答函数 ============================
+
+def _assert_question_context(q_info, observation, stage):
+    """在执行旧题点击前后，拦截已经切换到新题或完成页的上下文。"""
+    if not q_info or not observation:
+        return
+    expected_q_num = q_info.get("q_num")
+    if not expected_q_num:
+        return
+    if observation.get("page_state") == "complete":
+        raise StaleQuestionContext(
+            f"{stage}时页面已进入完成页，停止使用 {expected_q_num} 的坐标。"
+        )
+    actual_q_num = observation.get("q_num")
+    if actual_q_num and actual_q_num != expected_q_num:
+        raise StaleQuestionContext(
+            f"{stage}时题号已从 {expected_q_num} 变为 {actual_q_num}，"
+            "停止使用上一题坐标。"
+        )
+
 
 def verify_and_click(options_to_select, options_pos, q_info=None, max_retries=2):
     """
@@ -1357,6 +1586,7 @@ def verify_and_click(options_to_select, options_pos, q_info=None, max_retries=2)
     
     for attempt in range(max_retries):
         logger.info(f"  -> 第 {attempt+1}/{max_retries} 次尝试点击并验证: {options_to_select}")
+        _assert_question_context(q_info, _get_uia_page_marker(), "点击前")
         
         # 1. 先获取当前的选中状态
         current_data = q_info if q_info is not None else get_clipboard_data_robust()
@@ -1381,6 +1611,7 @@ def verify_and_click(options_to_select, options_pos, q_info=None, max_retries=2)
         # 3. 验证结果
         time.sleep(DELAY_BEFORE_VERIFY_CLICK) # 等待UI反应
         verified_data = get_clipboard_data_robust()
+        _assert_question_context(q_info, verified_data, "点击复核")
         actual_selection = set(verified_data.get('selected_options', [])) if verified_data else set()
         if q_info is not None and verified_data:
             q_info['selected_options'] = sorted(actual_selection)
@@ -1448,10 +1679,18 @@ def solve_with_qa_bank(q_info, options_pos, submit_pos):
             if verify_and_click(letters_to_click, options_pos, q_info):
                 if not click_submit_button():
                     return 'FALLBACK'
-                if wait_for_next_question(q_info.get('q_num'), q_text):
+                transition_result = wait_for_next_question(
+                    q_info.get('q_num'), q_text
+                )
+                if transition_result == TRANSITION_SUCCESS:
                     logger.info(f"🎉 [题库模式] 解答成功！")
                     return correct_answer_texts # 返回正确答案
-                else:
+                if transition_result == TRANSITION_UNKNOWN:
+                    raise TransitionEvidenceInsufficient(
+                        f"{q_info.get('q_num')} 提交后状态证据不足，"
+                        "禁止用上一题继续穷举。"
+                    )
+                if transition_result == TRANSITION_WRONG:
                     logger.warning(f"[题库模式] 提交后题目未刷新，题库答案可能已失效或错误。")
             
             # 如果题库答案错误，则回退到遍历模式
@@ -1482,11 +1721,19 @@ def solve_single_choice(q_info, options_pos, submit_pos):
         if verify_and_click([option_name], options_pos, q_info):
             if not click_submit_button():
                 continue
-            if wait_for_next_question(q_info.get('q_num'), q_info['q_text']):
+            transition_result = wait_for_next_question(
+                q_info.get('q_num'), q_info['q_text']
+            )
+            if transition_result == TRANSITION_SUCCESS:
                 correct_answer_text = q_info['options'][option_name]
                 logger.info(f"🎉 [遍历模式] 单选题 [{q_info['q_num']}] 的正确答案是: [{correct_answer_text}]")
                 return [correct_answer_text] # 以列表形式返回
-            else:
+            if transition_result == TRANSITION_UNKNOWN:
+                raise TransitionEvidenceInsufficient(
+                    f"{q_info.get('q_num')} 提交后状态证据不足，"
+                    "禁止尝试下一个单选项。"
+                )
+            if transition_result == TRANSITION_WRONG:
                 logger.info(f"选项 [{option_name}] 错误，继续...")
     logger.error(f"单选题 {q_info['q_text']} 在所有尝试后仍未解决。")
     return None
@@ -1517,11 +1764,19 @@ def solve_multiple_choice(q_info, options_pos, submit_pos):
             if verify_and_click(current_combo, options_pos, q_info):
                 if not click_submit_button():
                     continue
-                if wait_for_next_question(q_info.get('q_num'), q_info['q_text']):
+                transition_result = wait_for_next_question(
+                    q_info.get('q_num'), q_info['q_text']
+                )
+                if transition_result == TRANSITION_SUCCESS:
                     correct_answer_texts = [q_info['options'][letter] for letter in current_combo]
                     logger.info(f"🎉 [遍历模式] 多选题 [{q_info['q_num']}] 的正确答案是: {correct_answer_texts}")
                     return correct_answer_texts
-                else:
+                if transition_result == TRANSITION_UNKNOWN:
+                    raise TransitionEvidenceInsufficient(
+                        f"{q_info.get('q_num')} 提交后状态证据不足，"
+                        "禁止尝试下一个多选组合。"
+                    )
+                if transition_result == TRANSITION_WRONG:
                     logger.info(f"组合 {current_combo} 错误，继续...")
     
     logger.error(f"多选题 {q_info['q_text']} 在所有组合尝试后仍未解决。")
@@ -1620,43 +1875,55 @@ def main_loop(max_questions=None):
                 break
 
             correct_answer = None
+            restart_detection = False
             # ======================= 新增：重试循环 =======================
             for attempt in range(MAX_SOLVE_ATTEMPTS):
                 logger.info(f"--- 开始第 {attempt + 1}/{MAX_SOLVE_ATTEMPTS} 次尝试解答 [{q_info['q_num']}] ---")
 
-                # 选项和提交按钮均在真正点击前动态定位，避免重复截图。
-                submit_pos = None
-                options_pos = find_available_options(q_info)
-                if not options_pos:
-                    logger.error(f"在题目 {q_info['q_num']} 找不到任何选项，此次尝试失败。");
-                    time.sleep(RETRY_DELAY_BETWEEN_ATTEMPTS)
-                    continue # 继续下一次重试
-                
-                # 开始解题
-                use_fallback = False
-                # 如果启用题库，优先使用题库
-                if USE_QA_BANK:
-                    bank_result = solve_with_qa_bank(q_info, options_pos, submit_pos)
-                    if bank_result == 'FALLBACK':
-                        use_fallback = True
-                    else:
-                        correct_answer = bank_result
-                
-                # 如果不使用题库，或者题库解答失败，则使用遍历模式
-                if not USE_QA_BANK or use_fallback:
-                    if q_info['q_type'] == "单选题":
-                        correct_answer = solve_single_choice(q_info, options_pos, submit_pos)
-                    else: # 默认为多选题
-                        correct_answer = solve_multiple_choice(q_info, options_pos, submit_pos)
+                try:
+                    # 选项和提交按钮均在真正点击前动态定位，避免重复截图。
+                    submit_pos = None
+                    options_pos = find_available_options(q_info)
+                    if not options_pos:
+                        logger.error(f"在题目 {q_info['q_num']} 找不到任何选项，此次尝试失败。");
+                        time.sleep(RETRY_DELAY_BETWEEN_ATTEMPTS)
+                        continue # 继续下一次重试
 
-                # 如果成功解出答案，则跳出重试循环
-                if correct_answer:
-                    logger.info(f"🎉 在第 {attempt + 1} 次尝试中成功解答 [{q_info['q_num']}]！")
+                    # 开始解题
+                    use_fallback = False
+                    # 如果启用题库，优先使用题库
+                    if USE_QA_BANK:
+                        bank_result = solve_with_qa_bank(q_info, options_pos, submit_pos)
+                        if bank_result == 'FALLBACK':
+                            use_fallback = True
+                        else:
+                            correct_answer = bank_result
+
+                    # 如果不使用题库，或者题库解答失败，则使用遍历模式
+                    if not USE_QA_BANK or use_fallback:
+                        if q_info['q_type'] == "单选题":
+                            correct_answer = solve_single_choice(q_info, options_pos, submit_pos)
+                        else: # 默认为多选题
+                            correct_answer = solve_multiple_choice(q_info, options_pos, submit_pos)
+
+                    # 如果成功解出答案，则跳出重试循环
+                    if correct_answer:
+                        logger.info(f"🎉 在第 {attempt + 1} 次尝试中成功解答 [{q_info['q_num']}]！")
+                        break
+                    else:
+                        logger.warning(f"第 {attempt + 1} 次尝试解答失败。将在 {RETRY_DELAY_BETWEEN_ATTEMPTS} 秒后重试...")
+                        time.sleep(RETRY_DELAY_BETWEEN_ATTEMPTS)
+                except StaleQuestionContext as exc:
+                    logger.warning(f"{exc} 立即重新读取当前题目。")
+                    restart_detection = True
                     break
-                else:
-                    logger.warning(f"第 {attempt + 1} 次尝试解答失败。将在 {RETRY_DELAY_BETWEEN_ATTEMPTS} 秒后重试...")
-                    time.sleep(RETRY_DELAY_BETWEEN_ATTEMPTS)
+                except TransitionEvidenceInsufficient as exc:
+                    logger.critical(f"{exc} 本轮安全停止，未继续点击旧题。")
+                    return
             # ======================= 重试循环结束 =======================
+
+            if restart_detection:
+                continue
 
             # 在所有重试结束后，检查最终是否成功
             if correct_answer:
