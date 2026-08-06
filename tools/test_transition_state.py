@@ -130,6 +130,45 @@ class TransitionStateTests(unittest.TestCase):
 
         self.assertEqual(solver.TRANSITION_WRONG, result)
 
+    def test_visual_feedback_click_is_cancelled_after_question_changes(self):
+        screen = solver.np.zeros((1000, 600, 3), dtype=solver.np.uint8)
+        screen[200:400, 180:420] = 255
+        with (
+            patch.object(solver, "TARGET_MODE", "uia_standalone"),
+            patch.object(solver, "_click_uia_button", return_value=False),
+            patch.object(solver, "_capture_region_rgb", return_value=screen),
+            patch.object(
+                solver,
+                "_get_uia_page_marker",
+                return_value={"page_state": "question", "q_num": "第14题"},
+            ),
+            patch.object(solver, "click_at_region_pos") as click,
+        ):
+            dismissed = solver.dismiss_answer_feedback("第13题")
+
+        self.assertFalse(dismissed)
+        click.assert_not_called()
+
+    def test_visual_feedback_click_keeps_same_question(self):
+        screen = solver.np.zeros((1000, 600, 3), dtype=solver.np.uint8)
+        screen[200:400, 180:420] = 255
+        with (
+            patch.object(solver, "TARGET_MODE", "uia_standalone"),
+            patch.object(solver, "_click_uia_button", return_value=False),
+            patch.object(solver, "_capture_region_rgb", return_value=screen),
+            patch.object(
+                solver,
+                "_get_uia_page_marker",
+                return_value={"page_state": "question", "q_num": "第13题"},
+            ),
+            patch.object(solver, "click_at_region_pos") as click,
+            patch.object(solver.time, "sleep"),
+        ):
+            dismissed = solver.dismiss_answer_feedback("第13题")
+
+        self.assertTrue(dismissed)
+        click.assert_called_once()
+
     def test_stale_question_context_is_rejected(self):
         with self.assertRaises(solver.StaleQuestionContext):
             solver._assert_question_context(

@@ -7,8 +7,22 @@ import time
 import json
 import logging
 import argparse
+import ctypes
 from itertools import combinations
 from collections import defaultdict
+
+# Chromium 的渲染子窗口使用物理像素。必须在 GUI 库初始化前
+# 启用 DPI awareness，否则 125%/150% 缩放下会把鼠标消息发到错误句柄。
+if os.name == "nt":
+    try:
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(
+            ctypes.c_void_p(-4)  # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        )
+    except Exception:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            pass
 
 # 导入第三方库
 import pyautogui
@@ -294,6 +308,10 @@ def locate_and_activate_target_window():
                     continue
                 if win32gui.GetWindowText(handle).strip() != TARGET_TAB_TITLE:
                     continue
+                if win32gui.IsIconic(handle):
+                    logger.info("答题窗口已最小化，正在恢复")
+                    win32gui.ShowWindow(handle, win32con.SW_RESTORE)
+                    time.sleep(0.2)
                 window = desktop.window(handle=handle)
                 rect = window.rectangle()
                 if rect.width() <= 0 or rect.height() <= 0:
@@ -301,6 +319,7 @@ def locate_and_activate_target_window():
                 TARGET_WINDOW = window
                 TARGET_MODE = "uia_standalone"
                 SCREEN_REGION = (rect.left, rect.top, rect.width(), rect.height())
+                _set_target_topmost(True)
                 window.set_focus()
                 time.sleep(0.1)
                 logger.info(
@@ -340,6 +359,32 @@ def locate_and_activate_target_window():
         logger.error(f"枚举微信窗口失败: {exc}")
     logger.error(f"没有找到“{TARGET_TAB_TITLE}”答题窗口。")
     return False
+
+
+def _set_target_topmost(enabled):
+    """答题期间临时置顶，避免 WindowFromPoint 命中覆盖在上方的 Chromium 窗口。"""
+    if TARGET_WINDOW is None or not IS_WINDOWS:
+        return False
+    try:
+        insert_after = win32con.HWND_TOPMOST if enabled else win32con.HWND_NOTOPMOST
+        win32gui.SetWindowPos(
+            TARGET_WINDOW.handle,
+            insert_after,
+            0,
+            0,
+            0,
+            0,
+            win32con.SWP_NOMOVE
+            | win32con.SWP_NOSIZE
+            | win32con.SWP_NOACTIVATE
+            | win32con.SWP_SHOWWINDOW,
+        )
+        return True
+    except Exception as exc:
+        logger.warning(f"设置答题窗口置顶状态失败: {exc}")
+        return False
+
+
 def ensure_target_active():
     """快速确认目标窗口仍在前台；只有失效时才重新枚举 UIA 标签。"""
     global SCREEN_REGION
@@ -348,7 +393,13 @@ def ensure_target_active():
     try:
         if not win32gui.IsWindow(TARGET_WINDOW.handle):
             return locate_and_activate_target_window()
+        if win32gui.IsIconic(TARGET_WINDOW.handle):
+            logger.info("答题窗口已最小化，正在恢复")
+            win32gui.ShowWindow(TARGET_WINDOW.handle, win32con.SW_RESTORE)
+            time.sleep(0.2)
         rect = TARGET_WINDOW.rectangle()
+        if rect.width() <= 0 or rect.height() <= 0:
+            return locate_and_activate_target_window()
         SCREEN_REGION = (rect.left, rect.top, rect.width(), rect.height())
         if win32gui.GetForegroundWindow() != TARGET_WINDOW.handle:
             TARGET_WINDOW.set_focus()
@@ -565,8 +616,15 @@ def _uia_scroll_wheel(delta):
 
 def _scroll_uia_element_into_view(element_getter, max_steps=10):
     """反复滚动并重新读取控件，直到整个控件位于窗口可见区域。"""
-    viewport_top = SCREEN_REGION[1] + 4
-    viewport_bottom = SCREEN_REGION[1] + SCREEN_REGION[3] - 4
+    virtual_top = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)
+    virtual_bottom = virtual_top + win32api.GetSystemMetrics(
+        win32con.SM_CYVIRTUALSCREEN
+    )
+    viewport_top = max(SCREEN_REGION[1] + 4, virtual_top + 4)
+    viewport_bottom = min(
+        SCREEN_REGION[1] + SCREEN_REGION[3] - 4,
+        virtual_bottom - 4,
+    )
     for _ in range(max_steps):
         element = element_getter()
         if element is None:
@@ -977,13 +1035,50 @@ def position_page_at_bottom():
 
 
 def _capture_region_rgb():
-    return np.array(pyautogui.screenshot(region=SCREEN_REGION))
+    region_x, region_y, region_width, region_height = SCREEN_REGION
+    virtual_x = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)
+    virtual_y = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)
+    virtual_right = virtual_x + win32api.GetSystemMetrics(
+        win32con.SM_CXVIRTUALSCREEN
+    )
+    virtual_bottom = virtual_y + win32api.GetSystemMetrics(
+        win32con.SM_CYVIRTUALSCREEN
+    )
+    visible_left = max(region_x, virtual_x)
+    visible_top = max(region_y, virtual_y)
+    visible_right = min(region_x + region_width, virtual_right)
+    visible_bottom = min(region_y + region_height, virtual_bottom)
+    if visible_right <= visible_left or visible_bottom <= visible_top:
+        logger.warning("答题窗口完全位于可见屏幕外，无法截图")
+        return None
+    try:
+        visible_image = np.array(pyautogui.screenshot(region=(
+            visible_left,
+            visible_top,
+            visible_right - visible_left,
+            visible_bottom - visible_top,
+        )))
+    except Exception as exc:
+        logger.warning(f"截图失败，跳过本次视觉检测: {exc}")
+        return None
+
+    # 保留相对 SCREEN_REGION 的坐标系，屏外部分填黑。
+    canvas = np.zeros((region_height, region_width, 3), dtype=np.uint8)
+    offset_x = visible_left - region_x
+    offset_y = visible_top - region_y
+    canvas[
+        offset_y:offset_y + visible_image.shape[0],
+        offset_x:offset_x + visible_image.shape[1],
+    ] = visible_image[:, :, :3]
+    return canvas
 
 
 def _detect_option_boxes(screen_rgb=None):
     """检测当前视口内完整或部分可见的灰色/蓝色圆角选项框。"""
     if screen_rgb is None:
         screen_rgb = _capture_region_rgb()
+    if screen_rgb is None:
+        return []
     height, width = screen_rgb.shape[:2]
     gray = cv2.cvtColor(screen_rgb, cv2.COLOR_RGB2GRAY)
     edges = cv2.Canny(gray, 60, 160)
@@ -1046,6 +1141,8 @@ def _detect_option_circles(screen_rgb=None):
     """检测图形题左侧的单选/多选圆圈中心。"""
     if screen_rgb is None:
         screen_rgb = _capture_region_rgb()
+    if screen_rgb is None:
+        return []
     height, width = screen_rgb.shape[:2]
     gray = cv2.cvtColor(screen_rgb, cv2.COLOR_RGB2GRAY)
     blurred = cv2.GaussianBlur(gray, (7, 7), 1.5)
@@ -1131,6 +1228,8 @@ def _detect_submit_button(screen_rgb=None):
     """通过蓝色实心区域检测提交按钮，排除蓝色页头和选项边框。"""
     if screen_rgb is None:
         screen_rgb = _capture_region_rgb()
+    if screen_rgb is None:
+        return None
     height, width = screen_rgb.shape[:2]
     hsv = cv2.cvtColor(screen_rgb, cv2.COLOR_RGB2HSV)
     blue_mask = cv2.inRange(
@@ -1307,7 +1406,7 @@ def load_qa_bank():
         logger.warning(f"⚠️ 题库文件 '{QA_BANK_FILE}' 不存在，将仅使用遍历模式答题。")
         qa_bank = {}
 
-def dismiss_answer_feedback():
+def dismiss_answer_feedback(expected_q_num=None):
     """检测并关闭答错后的中央确认弹窗，避免遮罩拦截后续点击。"""
     if TARGET_MODE == "uia_standalone":
         for button_text in ("确定", "知道了", "再试一次", "继续"):
@@ -1316,6 +1415,8 @@ def dismiss_answer_feedback():
                 return True
 
     screen_rgb = _capture_region_rgb()
+    if screen_rgb is None:
+        return False
     height, width = screen_rgb.shape[:2]
     white_mask = np.where(
         np.all(screen_rgb >= 242, axis=2), 255, 0
@@ -1343,6 +1444,19 @@ def dismiss_answer_feedback():
         int(round(x + box_width / 2)),
         int(round(y + box_height * 0.78)),
     )
+    if expected_q_num:
+        marker = _get_uia_page_marker()
+        marker_q_num = marker.get("q_num") if marker else None
+        if (
+            not marker
+            or marker.get("page_state") != "question"
+            or marker_q_num != expected_q_num
+        ):
+            logger.info(
+                "视觉弹窗点击前题号已变化或暂不可用，取消旧题点击: "
+                f"expected={expected_q_num}, actual={marker_q_num or '未知'}"
+            )
+            return False
     logger.info(f"关闭答错确认弹窗: {confirm_pos}")
     click_at_region_pos(confirm_pos)
     time.sleep(0.15)
@@ -1457,7 +1571,7 @@ def wait_for_next_question(current_q_num, current_q_text):
                 observation, current_q_num, current_q_text
             )
             if evidence.get("request_error"):
-                dismiss_answer_feedback()
+                dismiss_answer_feedback(current_q_num)
                 raise RuntimeError(
                     "小程序请求失败，已停止本轮答题以避免误判答案。"
                 )
@@ -1472,7 +1586,7 @@ def wait_for_next_question(current_q_num, current_q_text):
                 if not (
                     feedback_action and _click_uia_button(feedback_action)
                 ):
-                    dismiss_answer_feedback()
+                    dismiss_answer_feedback(current_q_num)
                 return TRANSITION_WRONG
             if evidence["same_question"]:
                 last_same_seen_at = time.monotonic()
@@ -1480,7 +1594,7 @@ def wait_for_next_question(current_q_num, current_q_text):
                     logger.info(
                         f"题号仍为 {current_q_num}，检查是否存在答错弹窗。"
                     )
-                    if dismiss_answer_feedback():
+                    if dismiss_answer_feedback(current_q_num):
                         return TRANSITION_WRONG
                     next_feedback_check_at = (
                         time.monotonic() + QUESTION_HTML_FALLBACK_INTERVAL
@@ -1497,7 +1611,7 @@ def wait_for_next_question(current_q_num, current_q_text):
                     f"题号在 {QUESTION_TRANSITION_TIMEOUT:.1f} 秒内始终为 "
                     f"{current_q_num}，本次答案错误。"
                 )
-                dismiss_answer_feedback()
+                dismiss_answer_feedback(current_q_num)
                 return TRANSITION_WRONG
             grace_logged = True
             logger.warning(
@@ -1511,7 +1625,7 @@ def wait_for_next_question(current_q_num, current_q_text):
                     f"慢加载保护结束时题号仍为 {current_q_num}，"
                     "本次答案错误。"
                 )
-                dismiss_answer_feedback()
+                dismiss_answer_feedback(current_q_num)
                 return TRANSITION_WRONG
             logger.warning(
                 "慢加载保护结束后仍没有新题号、原题号或明确反馈，"
@@ -1979,5 +2093,6 @@ if __name__ == "__main__":
         logger.exception("脚本运行过程中发生未处理的异常！")
     finally:
         # 无论脚本是正常结束还是异常中断，都尝试保存已解出的答案
+        _set_target_topmost(False)
         write_solution_map_to_file()
         logger.info("脚本执行结束。")
