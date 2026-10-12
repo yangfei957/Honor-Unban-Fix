@@ -9,7 +9,6 @@ import logging
 import argparse
 import ctypes
 from itertools import combinations
-from collections import defaultdict
 
 # Chromium 的渲染子窗口使用物理像素。必须在 GUI 库初始化前
 # 启用 DPI awareness，否则 125%/150% 缩放下会把鼠标消息发到错误句柄。
@@ -27,7 +26,6 @@ if os.name == "nt":
 # 导入第三方库
 import pyautogui
 import pyperclip
-from airtest.core.cv import Template
 import numpy as np
 import cv2
 from pywinauto import Desktop
@@ -138,13 +136,6 @@ USE_QA_BANK = True
 # 主题库文件名。脚本将从此文件加载和更新题库。
 QA_BANK_FILE = "master_qa_bank.json"
 
-# ============================ 图像识别相似度配置 ============================
-# 选项图片(如 A.png, B.png)的识别阈值。范围 0.0 ~ 1.0，值越高代表要求匹配越精确。
-# 如果选项标识经常识别失败，可以适当降低此值。根据自己屏幕清晰度来调整。
-SIMILARITY_THRESHOLD_OPTION = 0.6
-# “提交”按钮图片的识别阈值。范围 0.0 ~ 1.0，值越高代表要求匹配越精确。根据自己屏幕清晰度来调整。
-SIMILARITY_THRESHOLD_SUBMIT = 0.6
-
 # 滚动页面的方式。
 # 'PC_WHEEL': 模拟桌面电脑的鼠标滚轮滚动，速度快，推荐在PC端模拟器或网页上使用。
 # 'MOBILE_DRAG': 模拟手机屏幕的拖动操作（从下往上拖动以向下滚动），适用于无法使用滚轮的场景。
@@ -222,66 +213,6 @@ STOP_AT_QUESTION_NUM = None
 # ===========================================================================
 
 
-# ------------------- 资源与模板定义 -------------------
-# 存放模板图片的目录 (如 option_A_1.png, option_A_2.png, option_B_1.png 等)
-TEMPLATES_DIR = "templates"
-if not os.path.exists(TEMPLATES_DIR): 
-    os.makedirs(TEMPLATES_DIR)
-    logger.warning(f"模板目录 '{TEMPLATES_DIR}' 不存在，已自动创建。请将模板图片放入其中。")
-
-def load_option_templates(directory, threshold=0.7):
-    """
-    从指定目录加载选项模板图片 (例如, option_A_1.png)。
-    支持同一选项有多个模板 (例如 option_A_1.png, option_A_2.png)，以提高识别率。
-    
-    Args:
-        directory (str): 存放模板图片的目录路径。
-        threshold (float): 图像匹配的相似度阈值。
-
-    Returns:
-        dict: 一个字典，键是选项名 ( 'A', 'B', ...)，值是对应的Template对象列表。
-              如果关键模板缺失，则返回空字典。
-    """
-    logger.info(f"开始从 '{directory}' 目录加载选项模板...")
-    option_templates = defaultdict(list)
-    try:
-        filenames = os.listdir(directory)
-    except FileNotFoundError:
-        logger.error(f"模板目录 '{directory}' 未找到！脚本无法继续。")
-        return {}
-    
-    # 使用正则表达式匹配文件名，格式为 "option_字母_序号.png"
-    pattern = re.compile(r"option_([A-D])_(\d+)\.png")
-    for filename in sorted(filenames):
-        match = pattern.match(filename)
-        if match:
-            option_name = match.group(1)
-            full_path = os.path.join(directory, filename)
-            # 使用配置的阈值创建Template对象
-            template = Template(full_path, threshold=threshold)
-            option_templates[option_name].append(template)
-            logger.info(f"  -> 已加载模板: {filename} for Option {option_name}")
-            
-    # 校验是否所有必需的选项 (A, B, C, D) 都有模板
-    required_options = {'A', 'B', 'C', 'D'}
-    loaded_options = set(option_templates.keys())
-    if not required_options.issubset(loaded_options):
-        missing = required_options - loaded_options
-        logger.error(f"模板文件不完整！templates文件夹中缺少选项 {sorted(list(missing))} 的模板图片。")
-        return {}
-        
-    logger.info("选项模板加载完成。")
-    return dict(option_templates)
-
-# 使用全局配置的相似度阈值来加载模板
-TEMPLATE_SUBMIT = Template(os.path.join(TEMPLATES_DIR, "submit_button.png"), threshold=SIMILARITY_THRESHOLD_SUBMIT)
-TEMPLATE_OPTIONS = load_option_templates(TEMPLATES_DIR, threshold=SIMILARITY_THRESHOLD_OPTION)
-
-# 如果选项模板加载失败，则无法进行答题，直接退出
-if not TEMPLATE_OPTIONS:
-    logger.critical("由于选项模板加载失败，脚本无法继续运行。")
-    exit()
-
 # 打印关键配置信息，方便用户检查
 logger.info(f"=========== 配置加载 ===========")
 logger.info(f"日志文件将保存至: {LOG_FILE_PATH}")
@@ -289,8 +220,6 @@ logger.info(f"本次运行截图将保存至: {SCREENSHOT_RUN_DIR}")
 logger.info(f"投屏区域 (Region): {SCREEN_REGION}")
 logger.info(f"启用题库模式: {'是' if USE_QA_BANK else '否'}")
 logger.info(f"启用HTML验证: {'是' if IS_WINDOWS else '否 (环境不支持)'}")
-logger.info(f"选项识别阈值: {SIMILARITY_THRESHOLD_OPTION}")
-logger.info(f"提交按钮识别阈值: {SIMILARITY_THRESHOLD_SUBMIT}")
 
 
 # --- 桌面微信窗口与操作核心函数 ---

@@ -1,8 +1,7 @@
-pyautogui
-pyperclip
-pywinauto
-opencv-python
-airtest
-numpy
-pywin32
-beautifulsoup4
+beautifulsoup4==4.15.0
+numpy==2.5.1
+opencv-python==5.0.0.93
+pyautogui==0.9.54
+pyperclip==1.11.0
+pywin32==312
+pywinauto==0.6.3

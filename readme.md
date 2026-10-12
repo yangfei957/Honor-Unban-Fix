@@ -58,7 +58,7 @@
 ## 运行环境
 
 - Windows 10 或 Windows 11
-- Python 3.8 或更高版本
+- 64 位 Python 3.14（已在 Python 3.14.6 上从空环境验证）
 - Windows 桌面版微信
 - 可在桌面微信中正常打开的“腾讯游戏安全中心”答题页面
 
@@ -68,11 +68,25 @@
 git clone https://github.com/yangfei957/Honor-Unban-Fix.git
 cd Honor-Unban-Fix
 
+python --version
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install --only-binary="numpy,opencv-python" -r requirements.txt
 ```
+
+不需要激活虚拟环境；文档中所有命令都显式使用项目内的
+`.venv\Scripts\python.exe`，避免把依赖装到全局 Python 或其他虚拟环境。
+
+安装后先执行环境自检：
+
+```powershell
+.\.venv\Scripts\python.exe -c "import sys; print('Python:', sys.version); import numpy; print('NumPy:', numpy.__version__); import cv2; print('OpenCV:', cv2.__version__); import pyautogui, pywinauto, win32gui; from bs4 import BeautifulSoup; print('Imports: OK')"
+.\.venv\Scripts\python.exe -m pip check
+.\.venv\Scripts\python.exe -m unittest tools.test_transition_state -v
+```
+
+自检应输出 `NumPy: 2.5.1`、`OpenCV: 5.0.0`、`Imports: OK`，
+`pip check` 应输出 `No broken requirements found.`，单元测试应全部通过。
 
 主要依赖包括：
 
@@ -81,7 +95,10 @@ pip install -r requirements.txt
 - `beautifulsoup4`：剪贴板 HTML 解析
 - `pyautogui`：截图及兼容模式下的桌面输入
 - `opencv-python`、`numpy`：按钮和选项区域的图像检测
-- `airtest`：兼容旧版模板匹配逻辑
+
+项目只使用 `opencv-python`，不依赖 `airtest`、`opencv-contrib-python`
+或任何 OpenCV headless 包。这些包都会提供同名的 `cv2`，混装后容易
+出现 NumPy ABI 冲突或导入到错误的 OpenCV 二进制文件。
 
 ## 使用方法
 
@@ -122,7 +139,7 @@ Honor-Unban-Fix/
 ├── auto_solver_refactored.py   # 主程序
 ├── master_qa_bank.json         # 文字题题库
 ├── requirements.txt            # Python 依赖
-├── templates/                  # 旧版模板匹配资源
+├── templates/                  # 历史模板资源（当前主程序不加载）
 ├── tools/                      # 坐标、合并和解析辅助工具
 ├── logs/                       # 运行日志（自动生成）
 └── screenshots/                # 调试截图和答案记录（自动生成）
@@ -135,6 +152,24 @@ Honor-Unban-Fix/
 测试命令、真题调试流程、已知限制和 Git 提交边界。
 
 ## 常见问题
+
+### `numpy.core.multiarray failed to import`
+
+这表示旧环境中混装了多套 OpenCV，或 OpenCV 与 NumPy 使用了不同
+ABI。最简单可靠的处理是删除旧 `.venv`，然后按上面的“安装”步骤
+重新创建。
+
+如果必须修复现有虚拟环境，执行：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip uninstall -y airtest opencv-python opencv-contrib-python opencv-python-headless opencv-contrib-python-headless numpy
+.\.venv\Scripts\python.exe -m pip install --only-binary="numpy,opencv-python" -r requirements.txt
+.\.venv\Scripts\python.exe -m pip check
+```
+
+最后重新执行安装段落中的环境自检。`pip list` 中只应有
+`opencv-python 5.0.0.93`，不应再出现 `opencv-contrib-python`、
+`opencv-python-headless` 或 `airtest`。
 
 ### 找不到答题窗口
 

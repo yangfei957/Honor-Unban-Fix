@@ -47,13 +47,17 @@
 ```powershell
 git clone https://github.com/yangfei957/Honor-Unban-Fix.git
 cd Honor-Unban-Fix
+python --version
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install --only-binary="numpy,opencv-python" -r requirements.txt
+.\.venv\Scripts\python.exe -m pip check
 ```
 
-当前依赖未锁定精确版本。遇到跨电脑差异时，先记录 Python 和依赖版本，
-不要立即通过大范围重构规避环境问题。
+依赖已按 Python 3.14.6 的已验证环境锁定。不要安装 `airtest`、
+`opencv-contrib-python` 或 OpenCV headless 包；它们与 `opencv-python`
+共用 `cv2` 命名空间，会导致 NumPy ABI 冲突。修改依赖后必须在全新
+虚拟环境里重跑 README 的安装和自检命令。
 
 运行前需要：
 
@@ -296,7 +300,7 @@ git add -- path\to\file1 path\to\file2
 
 ## 已知限制
 
-- `requirements.txt` 未固定版本，跨电脑可能出现依赖差异。
+- 当前依赖锁定并验证于 64 位 Python 3.14.6；其他 Python 版本需要单独验证。
 - 微信和小程序更新后，窗口类名、控件类型和 HTML 结构都可能变化。
 - UIA 在 Chromium 切页期间可能短暂为空。
 - HTML 后备模式比 UIA 慢，频繁调用会显著降低答题速度。
